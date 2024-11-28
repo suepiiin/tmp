@@ -181,3 +181,29 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def add_virtual_depots(distance_matrix_d0, n_virtual_depots):
+    num_customers = len(distance_matrix_d0) - 1
+    num_total_nodes = 1 + n_virtual_depots + num_customers
+    distance_matrix_with_virtual = [[0]*num_total_nodes for _ in range(num_total_nodes)]
+    d0_to_customers = distance_matrix_d0[0][1:]
+    for i in range(n_virtual_depots + 1):
+        for j in range(n_virtual_depots + 1):
+            distance_matrix_with_virtual[i][j] = 0
+    for depot_idx in range(n_virtual_depots + 1):
+        for customer_idx, dist in enumerate(d0_to_customers):
+            distance_matrix_with_virtual[depot_idx][n_virtual_depots + 1 + customer_idx] = dist
+    for customer_idx in range(num_customers):
+        dist = distance_matrix_d0[customer_idx + 1][0]
+        for depot_idx in range(n_virtual_depots + 1):
+            distance_matrix_with_virtual[n_virtual_depots + 1 + customer_idx][depot_idx] = dist
+    for i in range(num_customers):
+        for j in range(num_customers):
+            distance_matrix_with_virtual[n_virtual_depots + 1 + i][n_virtual_depots + 1 + j] = distance_matrix_d0[i + 1][j + 1]
+    return distance_matrix_with_virtual
+
+# 関数の使用例
+distance_matrix_with_virtual = add_virtual_depots(distance_matrix_d0, 3)
+for row in distance_matrix_with_virtual:
+    print(row)
