@@ -1,0 +1,546 @@
+#%%
+# -----------------------------------------------------
+# 1) OR-Toolsインストール（必要に応じて）
+# -----------------------------------------------------
+# !pip install ortools   # （Google Colabなどで実行する場合）
+
+from ortools.constraint_solver import pywrapcp
+from ortools.constraint_solver import routing_enums_pb2
+import math
+
+def create_data_model():
+    """
+    問題データ（顧客座標・需要量・車両台数・容量など）を定義する。
+    """
+    data = {}
+    
+    # --- (A) 座標定義（拠点含め計21箇所: index 0が拠点） ---
+    #     以下は例として「問題文で提示した(仮)座標」を使用
+    coords = [
+        (0, 0),     # 0: Depot(拠点)
+        (3, 1),     # 1
+        (4, 2),     # 2
+        (7, 1),     # 3
+        (6, 4),     # 4
+        (2, 3),     # 5
+        (1, 5),     # 6
+        (0, 8),     # 7
+        (4, 7),     # 8
+        (5, 8),     # 9
+        (7, 7),     # 10
+        (9, 6),     # 11
+        (10,5),     # 12
+        (8, 3),     # 13
+        (9, 2),     # 14
+        (10,1),     # 15
+        (2, 9),     # 16
+        (1, 10),    # 17
+        (3, 8),     # 18
+        (6, 9),     # 19
+        (8, 9),     # 20
+    ]
+    
+    data["coordinates"] = coords
+    data["num_locations"] = len(coords)  # 21
+    
+    # --- (B) 需要量の定義（index=0は拠点なので0） ---
+    demands = [
+        0,   # 拠点なので需要0
+        10, 12, 6,  8, 15,
+         5, 10, 9, 12,  6,
+         5,  8,15,10,  5,
+        15,  6, 7,13, 14
+    ]
+    data["demands"] = demands
+    
+    # --- (C) 車両台数と容量 ---
+    data["num_vehicles"] = 2    # 同時に運行できる車両2台
+    data["vehicle_capacity"] = 100  # 各車両の最大積載量
+    data["depot"] = 0           # 拠点のインデックス
+    
+    return data
+
+def compute_euclidean_distance_matrix(coords):
+    """
+    ユークリッド距離を用いた距離行列（2次元配列）を作成する。
+    """
+    n = len(coords)
+    distance_matrix = [[0]*n for _ in range(n)]
+    for i in range(n):
+        x_i, y_i = coords[i]
+        for j in range(n):
+            x_j, y_j = coords[j]
+            dist = math.sqrt((x_i - x_j)**2 + (y_i - y_j)**2)
+            # OR-ToolsのRoutingは整数コストを推奨(小数でも動くがスケーリング推奨)
+            # ここでは四捨五入して整数化
+            distance_matrix[i][j] = round(dist)
+    return distance_matrix
+
+def print_solution(data, manager, routing, solution):
+    """
+    得られた解(ルート)を表示し、各ルートのコスト等を出力。
+    """
+    total_distance = 0
+    for vehicle_id in range(data["num_vehicles"]):
+        index = routing.Start(vehicle_id)
+        route_distance = 0
+        route_load = 0
+        
+        route_str = f"Route for vehicle {vehicle_id}:\n  "
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            route_load += data["demands"][node_index]
+            route_str += f"{node_index} (load:{route_load}) -> "
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+            route_distance += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
+        
+        node_index = manager.IndexToNode(index)  # 最後の拠点(End)
+        route_str += f"{node_index}\n"
+        route_str += f"  Distance of the route: {route_distance}\n"
+        route_str += f"  Load of the route: {route_load}\n"
+        print(route_str)
+        
+        total_distance += route_distance
+    print(f"Total distance of all routes: {total_distance}\n")
+
+def main():
+    # 1) データ準備
+    data = create_data_model()
+    
+    # 2) 距離行列の作成
+    distance_matrix = compute_euclidean_distance_matrix(data["coordinates"])
+    
+    # 3) OR-ToolsのIndexManagerとRoutingModelの初期化
+    manager = pywrapcp.RoutingIndexManager(
+        data["num_locations"],     # 拠点含む場所の数(21)
+        data["num_vehicles"],      # 車両数(2)
+        data["depot"]             # デポ(拠点)のインデックス
+    )
+    routing = pywrapcp.RoutingModel(manager)
+    
+    # 4) 距離(コスト)計算用のコールバック登録
+    def distance_callback(from_index, to_index):
+        # OR-Tools内部のindexを実際のノードindexへ変換
+        from_node = manager.IndexToNode(from_index)
+        to_node   = manager.IndexToNode(to_index)
+        return distance_matrix[from_node][to_node]
+    
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    
+    # 5) 容量制約を設定(需要量コールバック)
+    def demand_callback(from_index):
+        from_node = manager.IndexToNode(from_index)
+        return data["demands"][from_node]
+    
+    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+    
+    routing.AddDimensionWithVehicleCapacity(
+        demand_callback_index,     # 需要量
+        0,                         # 容量に対する余裕(今回は0)
+        [data["vehicle_capacity"]]*data["num_vehicles"],  # 各車両の容量上限
+        True,                      # 容量超過は禁止
+        "Capacity"
+    )
+    
+    # 6) 探索パラメータ（ヒューリスティックや制限時間など）
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    # ローカルサーチ戦略（メタヒューリスティック）も設定可
+    search_parameters.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    # 最大探索時間(秒)
+    # 例: 30秒程度で打ち切る（短すぎると解の品質が下がり、長すぎると最適に近づきすぎる）
+    # 適宜調整しながら「最適解の90%前後」を狙う
+    search_parameters.time_limit.seconds = 30
+    
+    # 7) 解探索の実行
+    solution = routing.SolveWithParameters(search_parameters)
+    
+    # 8) 解の表示
+    if solution:
+        print_solution(data, manager, routing, solution)
+    else:
+        print("No solution found.")
+
+if __name__ == '__main__':
+    main()
+
+# %%
+from ortools.constraint_solver import pywrapcp
+from ortools.constraint_solver import routing_enums_pb2 as routing_enums
+import math
+
+def create_data_model():
+    """問題データの作成"""
+    data = {}
+    
+    # (A) 座標定義
+    coords = [
+        (0, 0),   # 0: Depot(拠点)
+        (3, 1),   # 1
+        (4, 2),   # 2
+        (7, 1),   # 3
+        (6, 4),   # 4
+        (2, 3),   # 5
+        (1, 5),   # 6
+        (0, 8),   # 7
+        (4, 7),   # 8
+        (5, 8),   # 9
+        (7, 7),   # 10
+        (9, 6),   # 11
+        (10,5),   # 12
+        (8, 3),   # 13
+        (9, 2),   # 14
+        (10,1),   # 15
+        (2, 9),   # 16
+        (1, 10),  # 17
+        (3, 8),   # 18
+        (6, 9),   # 19
+        (8, 9),   # 20
+    ]
+    data["coordinates"] = coords
+    data["num_locations"] = len(coords)
+    
+    # (B) 需要量
+    demands = [
+        0,   # 拠点なので需要0
+        10, 12, 6,  8, 15,
+         5, 10, 9, 12,  6,
+         5,  8,15,10,  5,
+        15,  6, 7,13, 14
+    ]
+    data["demands"] = demands
+    
+    # (C) 車両台数・容量
+    data["num_vehicles"] = 2       # 同時運行の車両数
+    data["vehicle_capacity"] = 100
+    data["depot"] = 0              # 拠点インデックス
+    return data
+
+def compute_euclidean_distance_matrix(coords):
+    """ユークリッド距離による距離行列を作成する"""
+    n = len(coords)
+    distance_matrix = [[0]*n for _ in range(n)]
+    for i in range(n):
+        x_i, y_i = coords[i]
+        for j in range(n):
+            x_j, y_j = coords[j]
+            dist = math.sqrt((x_i - x_j)**2 + (y_i - y_j)**2)
+            distance_matrix[i][j] = round(dist)
+    return distance_matrix
+
+def print_solution(data, manager, routing, solution, known_optimal=None):
+    """解を表示し、最適解とのギャップもあれば表示する"""
+    total_distance = 0
+    
+    for vehicle_id in range(data["num_vehicles"]):
+        index = routing.Start(vehicle_id)
+        route_distance = 0
+        route_load = 0
+        
+        route_str = f"Route for vehicle {vehicle_id}:\n  "
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            route_load += data["demands"][node_index]
+            route_str += f"{node_index} (load:{route_load}) -> "
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+            route_distance += routing.GetArcCostForVehicle(
+                previous_index, index, vehicle_id)
+        
+        route_str += f"{manager.IndexToNode(index)}\n"
+        route_str += f"  Distance of the route: {route_distance}\n"
+        route_str += f"  Load of the route: {route_load}\n"
+        print(route_str)
+        
+        total_distance += route_distance
+    
+    print(f"Total distance of all routes: {total_distance}")
+    
+    # もし既知の最適解(または下界・ベスト値)があれば、ギャップを計算して表示
+    if known_optimal is not None and known_optimal > 0:
+        gap_perc = (total_distance - known_optimal) / known_optimal * 100
+        print(f"Gap from the known best/optimal: {gap_perc:.2f}%\n")
+    else:
+        print()
+
+def main():
+    # 1) データの用意
+    data = create_data_model()
+    
+    # 2) 距離行列
+    distance_matrix = compute_euclidean_distance_matrix(data["coordinates"])
+    
+    # 3) RoutingModelの準備
+    manager = pywrapcp.RoutingIndexManager(
+        data["num_locations"], data["num_vehicles"], data["depot"]
+    )
+    routing = pywrapcp.RoutingModel(manager)
+    
+    # 4) 距離コールバック
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node   = manager.IndexToNode(to_index)
+        return distance_matrix[from_node][to_node]
+    transit_cb_idx = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb_idx)
+    
+    # 5) 容量制約(需要コールバック)
+    def demand_callback(from_index):
+        from_node = manager.IndexToNode(from_index)
+        return data["demands"][from_node]
+    demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_cb_idx, 0, [data["vehicle_capacity"]]*data["num_vehicles"],
+        True, "Capacity")
+    
+    # 6) 探索パラメータ設定
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+    search_parameters.local_search_metaheuristic = (
+        routing_enums.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
+    search_parameters.time_limit.seconds = 3  # 探索打ち切り時間(秒)
+    search_parameters.solution_limit = 5
+    
+    # 7) 解を探索
+    solution = routing.SolveWithParameters(search_parameters)
+    
+    # 8) 結果表示
+    if solution:
+        # 例として「既知の最適値 or ベスト値」を仮定：たとえば70と設定
+        # 実際には別途求めた値や論文から得た下界などを代入してください
+        known_optimal_distance = 56
+        
+        print_solution(
+            data, manager, routing, solution,
+            known_optimal=known_optimal_distance
+        )
+    else:
+        print("No solution found.")
+
+if __name__ == '__main__':
+    main()
+
+# %%
+from ortools.constraint_solver import pywrapcp
+import math
+
+def create_data_model():
+    """問題データの作成"""
+    data = {}
+    
+    # (A) 座標定義（拠点含め21箇所）
+    coords = [
+        (0, 0),   # 0: Depot(拠点)
+        (3, 1),   # 1
+        (4, 2),   # 2
+        (7, 1),   # 3
+        (6, 4),   # 4
+        (2, 3),   # 5
+        (1, 5),   # 6
+        (0, 8),   # 7
+        (4, 7),   # 8
+        (5, 8),   # 9
+        (7, 7),   # 10
+        (9, 6),   # 11
+        (10,5),   # 12
+        (8, 3),   # 13
+        (9, 2),   # 14
+        (10,1),   # 15
+        (2, 9),   # 16
+        (1, 10),  # 17
+        (3, 8),   # 18
+        (6, 9),   # 19
+        (8, 9),   # 20
+    ]
+    data["coordinates"] = coords
+    data["num_locations"] = len(coords)
+    
+    # (B) 需要量（拠点は0）
+    demands = [
+        0,   # depot
+        10, 12, 6,  8, 15,
+         5, 10, 9, 12,  6,
+         5,  8,15,10,  5,
+        15,  6, 7,13, 14
+    ]
+    data["demands"] = demands
+    
+    # (C) 車両数・容量
+    data["num_vehicles"] = 2
+    data["vehicle_capacity"] = 100
+    data["depot"] = 0  # 拠点のインデックス
+    
+    return data
+
+def compute_euclidean_distance_matrix(coords):
+    """ユークリッド距離による距離行列を作成"""
+    n = len(coords)
+    distance_matrix = [[0]*n for _ in range(n)]
+    for i in range(n):
+        x_i, y_i = coords[i]
+        for j in range(n):
+            x_j, y_j = coords[j]
+            dist = math.sqrt((x_i - x_j)**2 + (y_i - y_j)**2)
+            # OR-Toolsでは整数コストが推奨のため四捨五入
+            distance_matrix[i][j] = round(dist)
+    return distance_matrix
+
+def print_solution(data, manager, routing, solution, known_optimal=None):
+    """
+    得られたルートを表示し、既知の最適解(known_optimal)がある場合はギャップも表示。
+    """
+    total_distance = 0
+    
+    for vehicle_id in range(data["num_vehicles"]):
+        index = routing.Start(vehicle_id)
+        route_distance = 0
+        route_load = 0
+        
+        route_str = f"Route for vehicle {vehicle_id}:\n  "
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            route_load += data["demands"][node_index]
+            route_str += f"{node_index} (load:{route_load}) -> "
+            
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+            route_distance += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
+        
+        route_str += f"{manager.IndexToNode(index)}\n"
+        route_str += f"  Distance of the route: {route_distance}\n"
+        route_str += f"  Load of the route: {route_load}\n"
+        print(route_str)
+        
+        total_distance += route_distance
+    
+    print(f"Total distance of all routes: {total_distance}")
+    
+    # known_optimal とのギャップを計算
+    if known_optimal is not None and known_optimal > 0:
+        gap_perc = (total_distance - known_optimal) / known_optimal * 100
+        print(f"Gap from the known best/optimal: {gap_perc:.2f}%\n")
+    else:
+        print()
+
+def plot_solution(data, manager, routing, solution):
+    """
+    Matplotlibを使用してルートを可視化する。
+    各車両ルートを色分けし、拠点と顧客をプロット。
+    """
+    import matplotlib.pyplot as plt
+    
+    coords = data["coordinates"]
+    
+    fig, ax = plt.subplots(figsize=(6, 6))
+    
+    # (1) まず拠点・顧客を描画
+    # 拠点は四角形マーカー、顧客は小さい円
+    depot_x, depot_y = coords[data["depot"]]
+    
+    # 顧客を描画
+    for i in range(1, data["num_locations"]):
+        x, y = coords[i]
+        ax.scatter(x, y, c="blue", marker="o", alpha=0.7)
+        ax.text(x+0.1, y+0.1, str(i), fontsize=8)  # 顧客IDを少しずらして表示
+    
+    # 拠点を描画
+    ax.scatter(depot_x, depot_y, c="red", marker="s", s=100, label="Depot")
+    ax.text(depot_x+0.1, depot_y+0.1, "Depot(0)", fontsize=9, color="red")
+    
+    # (2) ルートを色分けしてプロット
+    color_list = ["C0", "C1", "C2", "C3", "C4", "C5"]  # matplotlibの既定カラー
+    
+    for vehicle_id in range(data["num_vehicles"]):
+        # 解からこの車両の巡回順序を取り出す
+        index = routing.Start(vehicle_id)
+        route_nodes = []
+        while not routing.IsEnd(index):
+            route_nodes.append(manager.IndexToNode(index))
+            index = solution.Value(routing.NextVar(index))
+        route_nodes.append(manager.IndexToNode(index))  # 終了ノード(拠点)を追加
+        
+        # ルートに従って線を描画
+        for i in range(len(route_nodes) - 1):
+            n1 = route_nodes[i]
+            n2 = route_nodes[i+1]
+            x1, y1 = coords[n1]
+            x2, y2 = coords[n2]
+            ax.plot([x1, x2], [y1, y2],
+                    color=color_list[vehicle_id % len(color_list)],
+                    linewidth=2)
+    
+    ax.set_title("Vehicle Routes (Solution)")
+    ax.legend()
+    ax.grid(True)
+    plt.show()
+
+def main():
+    # 1) データ準備
+    data = create_data_model()
+    
+    # 2) 距離行列
+    distance_matrix = compute_euclidean_distance_matrix(data["coordinates"])
+    
+    # 3) RoutingModelの作成
+    manager = pywrapcp.RoutingIndexManager(
+        data["num_locations"], 
+        data["num_vehicles"], 
+        data["depot"]
+    )
+    routing = pywrapcp.RoutingModel(manager)
+    
+    # 4) 距離コールバック
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node   = manager.IndexToNode(to_index)
+        return distance_matrix[from_node][to_node]
+    transit_cb_idx = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb_idx)
+    
+    # 5) 容量制約(需要コールバック)
+    def demand_callback(from_index):
+        from_node = manager.IndexToNode(from_index)
+        return data["demands"][from_node]
+    demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_callback)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_cb_idx, 0,
+        [data["vehicle_capacity"]]*data["num_vehicles"],
+        True, "Capacity"
+    )
+    
+    # 6) 探索パラメータ
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    search_parameters.local_search_metaheuristic = (
+        routing_enums.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    # 探索を打ち切る時間(秒) - 短めにして近似解を得る例
+    search_parameters.time_limit.seconds = 3
+    
+    # 7) 解の探索
+    solution = routing.SolveWithParameters(search_parameters)
+    
+    # 8) 結果表示と可視化
+    if solution:
+        # 例として「既知の最適値(仮)」を設定
+        known_optimal_distance = 56
+        print_solution(data, manager, routing, solution, known_optimal=known_optimal_distance)
+        
+        # グラフ描画
+        plot_solution(data, manager, routing, solution)
+    else:
+        print("No solution found.")
+
+if __name__ == '__main__':
+    main()
+
+# %%
